@@ -11,11 +11,26 @@ ELEVATION_FACTOR_K = 5  # 高程变化因子
 # --- 车辆技术指标 (附件3, 表1) ---
 VEHICLE_PARAMS = {
     'A': {
+        'max_load': 500,  # 最大载重 (kg)
         'max_slope': 30,
         'speed': {(0, 10): 30, (10, 20): 20, (20, 30): 10},  # km/h
-        'power_consumption': {(0, 10): 1.0, (10, 20): 1.5, (20, 30): 2.0}  # %/km
+        'power_consumption': {(0, 10): 1.0, (10, 20): 1.5, (20, 30): 2.0},  # %/km
+        # --- 充电规则 (附件3, 表3) ---
+        # 格式: (起始电量下限, 起始电量上限, 充2小时后达到的电量)
+        # 注意：区间为左闭右开 [lower, upper)
+        'charging_rules': [
+            (0, 20, 20),
+            (20, 50, 50),
+            (50, 80, 80),
+            (80, 100, 100)
+        ]
     }
 }
+
+# --- 车辆保障与维护规则 (附件3, 第四节) ---
+MAX_CHARGING_VEHICLES_PER_WAREHOUSE = 2  # 同一中转仓库最多同时为2辆无人车充电
+VALID_CHARGE_DURATIONS = [2, 4, 6, 8]  # 无人车每次充电时长只能是2小时的整倍数 (小时)
+VEHICLE_STATES = ['DRIVING', 'CHARGING', 'LOADING', 'UNLOADING', 'RESTING', 'WAITING'] # 无人车所有可能的状态
 
 # --- 里程加权系数 (附件3, 表2) ---
 # key: |dx|+|dy|, value: {d_theta: coeff}

@@ -1,38 +1,39 @@
-# 文件名: problem4_solver.py
-# 描述: 终极简化与加速版。完全依赖预处理数据，并修复了所有已知错误。
-
 import time
 import heapq
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from core import data_loader, vehicle_model, config, plot_tools
+from core import data_loader, vehicle_model, config
+import matplotlib.pyplot as plt
 
+# --- Matplotlib 中文显示设置 ---
+plt.rcParams['font.sans-serif'] = ['DengXian', 'SimHei', 'Microsoft YaHei', 'Source Han Sans CN']
+plt.rcParams['axes.unicode_minus'] = False
+
+# --- 全局常量和缓存 ---
 SAFETY_PENALTY = 1e9
 GEO_DATA_CACHE = {}
 
 
 def load_precomputed_data():
-    """加载预处理好的地理数据到全局缓存。"""
+    """加载预处理好的地理数据到全局缓存"""
     global GEO_DATA_CACHE
     if GEO_DATA_CACHE:
         return
     precomputed_file = './data/precomputed_geo_data.npz'
     try:
-        print(f"正在加载预处理的地理数据文件: {precomputed_file}...")
+        print(f"加载预处理地理数据: {precomputed_file}")
         data = np.load(precomputed_file)
         GEO_DATA_CACHE['slope'] = data['slope']
         GEO_DATA_CACHE['normals'] = data['normals']
         GEO_DATA_CACHE['rows'], GEO_DATA_CACHE['cols'] = data['slope'].shape
-        print("✅ 预处理地理数据加载成功！")
     except FileNotFoundError:
-        print(f"❌ 致命错误: 未找到预处理文件 '{precomputed_file}'。")
-        print("💡 请先运行 'preprocess_vectorized.py' 来生成此文件。")
+        print(f"未找到 '{precomputed_file}'，请先运行 preprocess_vectorized.py")
         exit()
 
 
 def get_geo_info(x, y):
-    """从缓存中快速获取地理信息。"""
+    """从缓存中快速获取坡度和法向量"""
     rows = GEO_DATA_CACHE['rows']
     r, c = (rows - 1) - int(y), int(x)
     if not (0 <= r < rows and 0 <= c < GEO_DATA_CACHE['cols']):
@@ -41,249 +42,319 @@ def get_geo_info(x, y):
 
 
 def evaluate_path(path, bad_zones):
-    """评估一条给定路径的全部四个指标。"""
-    total_mileage, total_time, total_stability, safety_time = 0, 0, 0, 0
+    """评估路径：平稳性、行程、时间、安全性"""
+    total_mileage = total_time = total_stability = safety_time = 0
     for i in range(1, len(path)):
-        p_from, h_from = path[i - 1]
-        p_to, h_to = path[i]
-        dx, dy = p_to[0] - p_from[0], p_to[1] - p_from[1]
-        d_theta = vehicle_model.calculate_angle_diff(h_to, h_from)
-        mileage = vehicle_model.calculate_segment_mileage(dx, dy, d_theta)
-        slope_to, normal_to = get_geo_info(p_to[0], p_to[1])
-        speed_kmh = vehicle_model.get_speed_by_slope(slope_to)
-        speed_mps = speed_kmh / 3.6
-        time_cost = mileage / speed_mps if speed_mps > 0 else float('inf')
-        total_mileage += mileage
-        total_time += time_cost
-        if p_to in bad_zones:
-            safety_time += time_cost
-        slope_from, normal_from = get_geo_info(p_from[0], p_from[1])
-        total_stability += vehicle_model.calculate_stability_cost(normal_from, normal_to, slope_from, slope_to)
-    return {'平稳性': total_stability, '里程(米)': total_mileage, '行驶时长(秒)': total_time, '安全性(秒)': safety_time}
+        (x0, y0), h0 = path[i - 1]
+        (x1, y1), h1 = path[i]
+        dx, dy = x1 - x0, y1 - y0
+        dtheta = vehicle_model.calculate_angle_diff(h1, h0)
+        segment_len = vehicle_model.calculate_segment_mileage(dx, dy, dtheta)
+        slope1, normal1 = get_geo_info(x1, y1)
+        speed_mps = vehicle_model.get_speed_by_slope(slope1) / 3.6
+        t = segment_len / speed_mps if speed_mps > 0 else float('inf')
+
+        total_mileage += segment_len
+        total_time += t
+        if (x1, y1) in bad_zones:
+            safety_time += t
+
+        slope0, normal0 = get_geo_info(x0, y0)
+        total_stability += vehicle_model.calculate_stability_cost(
+            normal0, normal1, slope0, slope1)
+
+    return {
+        '平稳性': total_stability,
+        '里程(米)': total_mileage,
+        '行驶时长(秒)': total_time,
+        '安全性(秒)': safety_time
+    }
 
 
 class FastAStarSolver:
-    """一个只依赖预处理数据的高速单向A*求解器。"""
+    """单向 A* 求解器"""
 
     def __init__(self, bad_zones, turn_rules):
         self.bad_zones = bad_zones
         self.turn_rules = turn_rules
         self.max_slope = config.VEHICLE_PARAMS['A']['max_slope']
 
-    def _get_cost(self, cost_type, p_from, p_to, h_from, h_to):
-        dx, dy = p_to[0] - p_from[0], p_to[1] - p_from[1]
-        d_theta = vehicle_model.calculate_angle_diff(h_to, h_from)
-        mileage = vehicle_model.calculate_segment_mileage(dx, dy, d_theta)
-        slope_to, normal_to = get_geo_info(p_to[0], p_to[1])
-        speed_kmh = vehicle_model.get_speed_by_slope(slope_to)
-        speed_mps = speed_kmh / 3.6
-        time_cost = mileage / speed_mps if speed_mps > 0 else float('inf')
-        cost = 0
+    def _get_cost(self, cost_type, p0, p1, h0, h1):
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        dtheta = vehicle_model.calculate_angle_diff(h1, h0)
+        seg_len = vehicle_model.calculate_segment_mileage(dx, dy, dtheta)
+        slope, normal = get_geo_info(p1[0], p1[1])
+        speed_mps = vehicle_model.get_speed_by_slope(slope) / 3.6
+        t = seg_len / speed_mps if speed_mps > 0 else float('inf')
         if cost_type == 'stability':
-            slope_from, normal_from = get_geo_info(p_from[0], p_from[1])
-            cost = vehicle_model.calculate_stability_cost(normal_from, normal_to, slope_from, slope_to)
+            slope0, normal0 = get_geo_info(p0[0], p0[1])
+            c = vehicle_model.calculate_stability_cost(normal0, normal, slope0, slope)
         elif cost_type == 'time':
-            cost = time_cost
-        elif cost_type == 'mileage':
-            cost = mileage
-        if p_to in self.bad_zones:
-            cost += SAFETY_PENALTY
-        return cost
+            c = t
+        else:  # mileage
+            c = seg_len
+        if p1 in self.bad_zones:
+            c += SAFETY_PENALTY
+        return c
 
-    def _get_heuristic(self, p_curr, p_goal):
-        dx = abs(p_curr[0] - p_goal[0])
-        dy = abs(p_curr[1] - p_goal[1])
-        return (config.CELL_SIZE * (dx + dy) + (config.CELL_SIZE * np.sqrt(2) - 2 * config.CELL_SIZE) * min(dx, dy))
+    def _get_heuristic(self, p, goal):
+        dx = abs(p[0] - goal[0]); dy = abs(p[1] - goal[1])
+        c1 = config.CELL_SIZE * (dx + dy)
+        c2 = (config.CELL_SIZE * np.sqrt(2) - 2 * config.CELL_SIZE) * min(dx, dy)
+        return c1 + c2
 
-    def search(self, start_coords, goal_coords, cost_type):
-        start_node, goal_coords = (start_coords, 0), tuple(goal_coords)
-        h_start = self._get_heuristic(start_coords, goal_coords)
-        open_set = [(h_start, 0, start_node)]
-        came_from, g_costs = {}, defaultdict(lambda: float('inf'))
-        g_costs[start_node] = 0
-        node_count = 0
+    def search(self, start, goal, cost_type):
+        start_node = (start, 0)
+        goal = tuple(goal)
+        open_set = [(self._get_heuristic(start, goal), 0, start_node)]
+        came_from = {}
+        g_cost = defaultdict(lambda: float('inf'))
+        g_cost[start_node] = 0
+        count = 0
         while open_set:
-            node_count += 1
-            if node_count % 50000 == 0:
-                print(f"  (单向)已探索 {node_count} 个状态节点...")
-            f, g, u_node = heapq.heappop(open_set)
-            u_coords, u_heading = u_node
-            if g > g_costs[u_node]:
+            count += 1
+            _, g0, u = heapq.heappop(open_set)
+            if g0 > g_cost[u]:
                 continue
-            if u_coords == goal_coords:
-                print(f"✅ (单向)找到路径！总共探索了 {node_count} 个状态。")
-                return self._reconstruct_path(came_from, u_node)
+            ux, uy = u[0]
+            if (ux, uy) == goal:
+                print(f"✅ (单向)找到路径，节点数={count}")
+                return self._reconstruct_path(came_from, u), g_cost, None
+
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0:
-                        continue
-                    v_coords = (u_coords[0] + dx, u_coords[1] + dy)
-                    if get_geo_info(v_coords[0], v_coords[1])[0] > self.max_slope:
-                        continue
-                    allowed_headings = self.turn_rules[u_heading].get((dx, dy))
-                    if not allowed_headings:
-                        continue
-                    for v_heading in allowed_headings:
-                        v_node = (v_coords, v_heading)
-                        step_cost = self._get_cost(cost_type, u_coords, v_coords, u_heading, v_heading)
-                        tentative_g = g_costs[u_node] + step_cost
-                        if tentative_g < g_costs[v_node]:
-                            came_from[v_node] = u_node
-                            g_costs[v_node] = tentative_g
-                            h = self._get_heuristic(v_coords, goal_coords)
-                            heapq.heappush(open_set, (tentative_g + h, tentative_g, v_node))
-        print(f"❌ (单向)未能找到路径！探索了 {node_count} 个节点。")
-        return None
+                    if dx == dy == 0: continue
+                    v = (ux+dx, uy+dy)
+                    slope_v, _ = get_geo_info(v[0], v[1])
+                    if slope_v > self.max_slope: continue
+                    for vh in self.turn_rules[u[1]].get((dx, dy), []):
+                        vn = (v, vh)
+                        c = self._get_cost(cost_type, u[0], v, u[1], vh)
+                        ng = g_cost[u] + c
+                        if ng < g_cost[vn]:
+                            g_cost[vn] = ng
+                            came_from[vn] = u
+                            f = ng + self._get_heuristic(v, goal)
+                            heapq.heappush(open_set, (f, ng, vn))
 
-    def _reconstruct_path(self, came_from, current_node):
-        path = [current_node]
-        while current_node in came_from:
-            path.append(current_node)
-            current_node = came_from[current_node]
+        print(f"❌ (单向)未找到路径，节点数={count}")
+        return None, g_cost, None
+
+    def _reconstruct_path(self, came_from, node):
+        path = [node]
+        while node in came_from:
+            node = came_from[node]
+            path.append(node)
         return path[::-1]
 
 
 class FastBidirectionalAStarSolver:
+    """双向 A* 求解器"""
+
     def __init__(self, solver: FastAStarSolver):
         self.solver = solver
         self.max_slope = solver.max_slope
         self.turn_rules = solver.turn_rules
 
-    def search(self, start_coords, goal_coords, cost_type):
-        start_node, goal_node = (start_coords, 0), (goal_coords, 0)
-        open_fwd, g_fwd, came_from_fwd = [(self.solver._get_heuristic(start_coords, goal_coords), 0, start_node)], {
-            start_node: 0}, {}
-        open_bwd, g_bwd, came_from_bwd = [(self.solver._get_heuristic(goal_coords, start_coords), 0, goal_node)], {
-            goal_node: 0}, {}
-
-        # [修复] 正确初始化两个空字典
-        closed_fwd, closed_bwd = {}, {}
-
-        mu, meet_node, node_count = float('inf'), None, 0
+    def search(self, start, goal, cost_type):
+        start_node = (start, 0)
+        goal_node = (tuple(goal), 0)
+        open_fwd = [(self.solver._get_heuristic(start, goal), 0, start_node)]
+        open_bwd = [(self.solver._get_heuristic(goal, start), 0, goal_node)]
+        g_fwd = {start_node: 0}
+        g_bwd = {goal_node: 0}
+        cf = {}
+        cb = {}
+        closed_fwd = {}
+        closed_bwd = {}
+        mu = float('inf')
+        meet_node = None
+        count = 0
 
         while open_fwd and open_bwd:
-            node_count += 1
-            if node_count % 10000 == 0:
-                print(f"  (双向)已探索 {node_count}*2 个状态节点... mu={mu:.2f}")
+            count += 1
+            # 交替展开
+            f_list, g_list, cf_list, closed_list = \
+                (open_fwd, g_fwd, cf, closed_fwd) if len(open_fwd) <= len(open_bwd) else \
+                (open_bwd, g_bwd, cb, closed_bwd)
+            h_other = open_bwd[0][1] if f_list is open_fwd else open_fwd[0][1]
 
-            _, g_u, u_node = heapq.heappop(open_fwd)
-            u_coords, u_heading = u_node
-
-            if g_u > g_fwd.get(u_node, float('inf')):
+            _, gu, un = heapq.heappop(f_list)
+            if gu > g_list.get(un, float('inf')):
                 continue
-            closed_fwd[u_node] = g_u
+            closed_list[un] = gu
 
-            if g_u + open_bwd[0][1] >= mu:
-                print(f"✅ (双向)找到最优路径！总共探索了 {len(closed_fwd) + len(closed_bwd)} 个节点。")
-                return self._reconstruct_path(came_from_fwd, came_from_bwd, meet_node)
+            # 检查剪枝条件
+            if gu + h_other >= mu:
+                print(f"✅ (双向)找到最优路径，已探索 {count*2} 次扩展，μ={mu:.2f}")
+                break
 
+            ux, uy = un[0]
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0:
-                        continue
-                    v_coords = (u_coords[0] + dx, u_coords[1] + dy)
-                    if get_geo_info(v_coords[0], v_coords[1])[0] > self.max_slope:
-                        continue
-                    allowed_headings = self.turn_rules[u_heading].get((dx, dy))
-                    if not allowed_headings:
-                        continue
-                    for v_heading in allowed_headings:
-                        v_node = (v_coords, v_heading)
-                        if v_node in closed_fwd:
-                            continue
-                        cost = self.solver._get_cost(cost_type, u_coords, v_coords, u_heading, v_heading)
-                        if g_u + cost < g_fwd.get(v_node, float('inf')):
-                            g_fwd[v_node] = g_u + cost
-                            came_from_fwd[v_node] = u_node
-                            h = self.solver._get_heuristic(v_coords, goal_coords)
-                            heapq.heappush(open_fwd, (g_fwd[v_node] + h, g_fwd[v_node], v_node))
-                        if v_node in closed_bwd:
-                            path_cost = g_fwd[v_node] + closed_bwd[v_node]
-                            if path_cost < mu:
-                                mu, meet_node = path_cost, v_node
-            # 交换方向
-            open_fwd, open_bwd = open_bwd, open_fwd
-            g_fwd, g_bwd = g_bwd, g_fwd
-            came_from_fwd, came_from_bwd = came_from_bwd, came_from_bwd
-            closed_fwd, closed_bwd = closed_bwd, closed_fwd
-            start_coords, goal_coords = goal_coords, start_coords
+                    if dx == dy == 0: continue
+                    v = (ux+dx, uy+dy)
+                    slope_v, _ = get_geo_info(v[0], v[1])
+                    if slope_v > self.max_slope: continue
+                    for vh in self.turn_rules[un[1]].get((dx, dy), []):
+                        vn = (v, vh)
+                        cost = self.solver._get_cost(cost_type, un[0], v, un[1], vh)
+                        if un in g_fwd and vn in g_bwd:
+                            # 双向相遇
+                            cand = g_fwd[un] + cost + g_bwd[vn]
+                            if cand < mu:
+                                mu = cand
+                                meet_node = vn if f_list is open_fwd else un
+                        # 松弛
+                        got = gu + cost
+                        if got < g_list.get(vn, float('inf')):
+                            g_list[vn] = got
+                            cf_list[vn] = un
+                            heapq.heappush(f_list,
+                                           (got + self.solver._get_heuristic(v, goal if f_list is open_fwd else start),
+                                            got, vn))
 
-        print(f"❌ (双向)未能找到路径，探索了 {len(closed_fwd) + len(closed_bwd)} 个节点。")
-        return None
+        # 重建路径
+        path = None
+        if meet_node is not None:
+            path = self._reconstruct_path(cf, cb, meet_node)
+        print(f"总共探索节点: 前向={len(g_fwd)}, 后向={len(g_bwd)}, μ={mu:.2f}")
+        return path, g_fwd, g_bwd
 
-    def _reconstruct_path(self, came_from_fwd, came_from_bwd, meet_node):
-        path_fwd, curr = [], meet_node
-        while curr in came_from_fwd:
-            path_fwd.append(curr)
-            curr = came_from_fwd[curr]
-        path_fwd.append(curr)
-        path_fwd.reverse()
+    def _reconstruct_path(self, cf, cb, meet_node):
+        # 从 meet_node 向两端回溯
+        left, curr = [], meet_node
+        while curr in cf:
+            left.append(curr)
+            curr = cf[curr]
+        left.append(curr)
+        left.reverse()
 
-        path_bwd, curr = [], meet_node
-        while curr in came_from_bwd:
-            curr = came_from_bwd[curr]
-            path_bwd.append(curr)
+        right = []
+        curr = meet_node
+        while curr in cb:
+            curr = cb[curr]
+            right.append(curr)
+        return left + right
 
-        return path_fwd + path_bwd
+
+def visualize_bidirectional_search_simple(
+        g_fwd, g_bwd, path,
+        start_coords, goal_coords,
+        meet_states, task):
+    """用散点高亮前/后向探索，以及真正的碰头状态。"""
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # 前向探索
+    x0 = [s[0][0] for s in g_fwd.keys()]
+    y0 = [s[0][1] for s in g_fwd.keys()]
+    ax.scatter(x0, y0, c='C0', s=5, alpha=0.4, label='前向探索')
+
+    # 后向探索
+    x1 = [s[0][0] for s in g_bwd.keys()]
+    y1 = [s[0][1] for s in g_bwd.keys()]
+    ax.scatter(x1, y1, c='C3', s=5, alpha=0.4, label='后向探索')
+
+    # 最优路径
+    if path:
+        pts = np.array([p[0] for p in path])
+        ax.plot(pts[:, 0], pts[:, 1], c='cyan', lw=2.5, label='最优路径')
+
+    # 起点/终点
+    ax.scatter(start_coords[0], start_coords[1],
+               c='lime', edgecolor='k', s=150, zorder=10, label='起点')
+    ax.scatter(goal_coords[0], goal_coords[1],
+               c='magenta', marker='s', edgecolor='k', s=150, zorder=10, label='终点')
+
+    # 真正的碰头状态
+    for coords, heading in meet_states:
+        ax.scatter(coords[0], coords[1],
+                   c='yellow', marker='X', s=200,
+                   edgecolor='black', linewidth=2, zorder=15,
+                   label=f'碰头 {coords},{heading}')
+
+    ax.set_title(f'双向A* 探索范围及路径 ({task["start"]}-{task["goal"]})')
+    ax.set_xlabel('栅格 x 坐标'); ax.set_ylabel('栅格 y 坐标')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    return fig
 
 
 def solve_problem4():
-    print("=" * 20 + " 开始求解问题4 (终极优化版) " + "=" * 20)
+    print("=" * 20, "开始求解问题4", "=" * 20)
     start_all = time.perf_counter()
 
     load_precomputed_data()
     bad_zones = data_loader.load_bad_zones()
     turn_rules = vehicle_model.generate_turn_rules()
-    locations_df = pd.read_excel('./data/各点位位置信息.xlsx')
-    locations = locations_df.set_index('编号').to_dict('index')
+    loc_df = pd.read_excel('./data/各点位位置信息.xlsx')
+    locs = loc_df.set_index('编号').to_dict('index')
 
-    uni_solver = FastAStarSolver(bad_zones, turn_rules)
-    bi_solver = FastBidirectionalAStarSolver(uni_solver)
+    uni = FastAStarSolver(bad_zones, turn_rules)
+    bi = FastBidirectionalAStarSolver(uni)
 
     tasks = [
         {'start': 'C6', 'goal': 'Z5', 'objective': 'stability'},
         {'start': 'C3', 'goal': 'Z4', 'objective': 'time'},
         {'start': 'C5', 'goal': 'Z7', 'objective': 'mileage'},
     ]
-    results_table = []
+    results = []
 
-    for task in tasks:
-        if task['objective'] == 'stability':
-            print(f"\n--- [双向A*] 开始任务: {task['start']} -> {task['goal']} (目标: {task['objective']}) ---")
-            solver_to_use = bi_solver
+    for t in tasks:
+        s = (locs[t['start']]['栅格x坐标'], locs[t['start']]['栅格y坐标'])
+        g = (locs[t['goal']]['栅格x坐标'], locs[t['goal']]['栅格y坐标'])
+        print(f"\n>> 任务 {t['start']}->{t['goal']} (目标={t['objective']})")
+        tic = time.perf_counter()
+        if t['objective'] == 'stability':
+            path, g_fwd, g_bwd = bi.search(s, g, t['objective'])
+            meet_states = set(g_fwd.keys()) & set(g_bwd.keys())
+            print(">>> 碰头状态数:", len(meet_states))
         else:
-            print(f"\n--- [单向A*] 开始任务: {task['start']} -> {task['goal']} (目标: {task['objective']}) ---")
-            solver_to_use = uni_solver
+            path, g_fwd, _ = uni.search(s, g, t['objective'])
+            g_bwd = {}
+            meet_states = set()
 
-        start_coords = (locations[task['start']]['栅格x坐标'], locations[task['start']]['栅格y坐标'])
-        goal_coords = (locations[task['goal']]['栅格x坐标'], locations[task['goal']]['栅格y坐标'])
+        print(f"任务耗时: {time.perf_counter() - tic:.2f}s")
+        if not path:
+            continue
 
-        start_task_time = time.perf_counter()
-        path = solver_to_use.search(start_coords, goal_coords, task['objective'])
-        print(f"任务耗时: {time.perf_counter() - start_task_time:.2f} 秒。")
+        # 评估并存表
+        m = evaluate_path(path, bad_zones)
+        m['路径'] = f"{t['start']}-{t['goal']}"
+        results.append(m)
 
-        if path:
-            metrics = evaluate_path(path, bad_zones)
-            metrics['路径起止点'] = f"{task['start']}-{task['goal']}"
-            results_table.append(metrics)
+        # 保存路径明细
+        df_path = pd.DataFrame([
+            {'编号': f'L{i}', 'x': p[0][0], 'y': p[0][1], 'heading': p[1]}
+            for i, p in enumerate(path)
+        ])
+        fn_map = {
+            'stability': '附件8：C6-Z5平稳性最优路径',
+            'time':      '附件9：C3-Z4时效性最优路径',
+            'mileage':   '附件10：C5-Z7路程最短路径',
+        }
+        df_path.to_excel(f'output/{fn_map[t["objective"]]}.xlsx', index=False)
 
-            path_data = [{'编号': f"L{i}", '栅格x坐标': c[0], '栅格y坐标': c[1], '车头朝向': h} for i, (c, h) in
-                         enumerate(path)]
-            path_df = pd.DataFrame(path_data)
-            outfile_map = {'stability': '附件8：C6-Z5平稳性最优路径', 'time': '附件9：C3-Z4时效性最优路径',
-                           'mileage': '附件10：C5-Z7路程最短路径'}
-            output_path = f"output/{outfile_map[task['objective']]}.xlsx"
-            path_df.to_excel(output_path, index=False)
-            print(f"路径已保存至: {output_path}")
+        # 只对 stability 画散点图
+        if t['objective'] == 'stability':
+            fig = visualize_bidirectional_search_simple(
+                g_fwd, g_bwd, path,
+                s, g,
+                meet_states, t
+            )
+            fig.savefig(f'output/双向散点_{t["start"]}-{t["goal"]}.png', dpi=300, bbox_inches='tight', pad_inches=0.05)
+            plt.show()
 
-    print("\n\n" + "=" * 25 + " 问题4 最终路径评估结果 " + "=" * 25)
-    if results_table:
-        df_results = pd.DataFrame(results_table)
-        df_results = df_results[['路径起止点', '平稳性', '里程(米)', '行驶时长(秒)', '安全性(秒)']]
-        print(df_results.to_string(index=False))
-    print(f"\n问题4总耗时: {(time.perf_counter() - start_all) / 60:.2f} 分钟")
+    # 打印汇总
+    if results:
+        df_res = pd.DataFrame(results)
+        df_res = df_res[['路径','平稳性','里程(米)','行驶时长(秒)','安全性(秒)']]
+        print("\n最终评估：\n", df_res.to_string(index=False))
+
+    print(f"\n总耗时 {(time.perf_counter() - start_all)/60:.2f} 分钟")
 
 
 if __name__ == '__main__':
     solve_problem4()
-

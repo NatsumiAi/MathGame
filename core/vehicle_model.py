@@ -144,3 +144,36 @@ def generate_turn_rules():
     return rules
 
 
+def calculate_final_charge(start_level, charge_duration_hours):
+    """
+    根据车辆A的充电规则，计算充电后的最终电量。
+    严格遵循附件3的累计充电规则。
+    :param start_level: 开始充电时的电量百分比 (例如 16)
+    :param charge_duration_hours: 充电时长，必须是2, 4, 6, 8之一
+    :return: 充电结束后的电量百分比
+    """
+    if charge_duration_hours not in config.VALID_CHARGE_DURATIONS:
+        raise ValueError(f"充电时长无效: {charge_duration_hours}。有效时长为: {config.VALID_CHARGE_DURATIONS}")
+    rules = config.VEHICLE_PARAMS['A']['charging_rules']
+    current_level = float(start_level)
+
+    # 将总充电时长分解为多个2小时的片段
+    num_segments = charge_duration_hours // 2
+    for i in range(num_segments):
+        # 如果已经充满，则提前结束
+        if current_level >= 100:
+            break
+
+        # 查找当前电量所在的规则区间
+        charged_in_segment = False
+        for lower_bound, upper_bound, target_level in rules:
+            # 使用左闭右开区间，但对100%特殊处理
+            if (lower_bound <= current_level < upper_bound) or (current_level == 100 and upper_bound == 100):
+                current_level = float(target_level)
+                charged_in_segment = True
+                break
+
+        # 如果没有找到规则（理论上不应发生），保持电量不变
+        if not charged_in_segment:
+            print(f"警告: 在电量 {current_level}% 时未找到匹配的充电规则。")
+    return current_level
