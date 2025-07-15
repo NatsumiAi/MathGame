@@ -67,6 +67,24 @@ def calculate_angle_diff(angle1, angle2):
     return min(diff, 360 - diff)
 
 
+def get_power_consumption(slope, vehicle_type='A'):
+    """
+    根据地形坡度获取无人车的耗电系数。
+
+    :param slope: 当前栅格的坡度 (度)。
+    :param vehicle_type: 车辆型号，默认为'A'。
+    :return: 对应的耗电系数 (%/km)。
+    """
+    consumption_rules = config.VEHICLE_PARAMS[vehicle_type]['power_consumption']
+    # 注意：根据附件，[20, 30]是闭区间，我们需要单独处理30
+    if slope == 30:
+        return consumption_rules.get((20, 30), 2.0)
+    # 遍历其余耗电规则（通常是左闭右开）
+    for (s_min, s_max), consumption in consumption_rules.items():
+        if s_min <= slope < s_max:
+            return consumption
+    return consumption_rules.get((20, 30), 2.0)
+
 def calculate_stability_cost(normal_vec1, normal_vec2, slope1, slope2):
     """
     计算单个路段的平稳性成本。

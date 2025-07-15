@@ -59,3 +59,23 @@ def load_path_data(file_name, data_folder='data'):
     else:
         df.columns = ['x', 'y']
     return df
+
+
+def load_points_info(data_folder='data'):
+    """
+    加载各点位置信息.xlsx文件。
+
+    :param data_folder: 包含 '各点位置信息.xlsx' 的文件夹路径。
+    :return: 包含点位信息的 pandas DataFrame，如果文件不存在则返回 None。
+    """
+    file_path = os.path.join(data_folder, '各点位位置信息.xlsx')
+    if not os.path.exists(file_path):
+        print(f"⚠️  警告: 点位信息文件未找到: {file_path}")
+        return None
+    try:
+        df = pd.read_excel(file_path)
+        print(f"✅ 成功加载点位信息: {file_path} ({len(df)}个点)")
+        return df
+    except Exception as e:
+        print(f"❌ 错误: 读取点位信息文件失败: {e}")
+        return None
